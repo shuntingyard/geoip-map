@@ -11,3 +11,5 @@ DataServerDB/GeoLite2-City.mmdb.gz
 DataServer/__pycache__/
 
 AttackMapServer/static/flags/*
+
+logmirrors/*

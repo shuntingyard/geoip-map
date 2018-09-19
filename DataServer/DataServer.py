@@ -29,7 +29,7 @@ redis_ip = '127.0.0.1'
 redis_instance = None
 
 # required input paths
-syslog_path = '/var/log/syslog'
+syslog_path = '../logmirrors/rsyslog.log'
 #syslog_path = '/var/log/reverse-proxy.log'
 db_path = '../DataServerDB/GeoLite2-City.mmdb'
 
@@ -158,28 +158,31 @@ def parse_maxminddb(db_path, ip):
 
 def parse_syslog(line):
     line = line.split()
-    data = line[-1]
-    data = data.split(',')
+    try:
+        data = line[-1]
+        data = data.split(',')
 
-    if len(data) != 6:
-        print('NOT A VALID LOG')
-        return False
-    else:
-        src_ip = data[0]
-        dst_ip = data[1]
-        src_port = data[2]
-        dst_port = data[3]
-        type_attack = data[4]
-        cve_attack = data[5]
-        data_dict = {
-                    'src_ip': src_ip,
-                    'dst_ip': dst_ip,
-                    'src_port': src_port,
-                    'dst_port': dst_port,
-                    'type_attack': type_attack,
-                    'cve_attack': cve_attack
-                    }
-        return data_dict
+        if len(data) != 6:
+            print('NOT A VALID LOG')
+            return False
+        else:
+            src_ip = data[0]
+            dst_ip = data[1]
+            src_port = data[2]
+            dst_port = data[3]
+            type_attack = data[4]
+            cve_attack = data[5]
+            data_dict = {
+                        'src_ip': src_ip,
+                        'dst_ip': dst_ip,
+                        'src_port': src_port,
+                        'dst_port': dst_port,
+                        'type_attack': type_attack,
+                        'cve_attack': cve_attack
+                        }
+            return data_dict
+    except IndexError:
+        pass
 
 
 def shutdown_and_report_stats():

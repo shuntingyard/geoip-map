@@ -1,4 +1,5 @@
 maxminddb==1.2.2
 redis==2.10.5
+syslogmp==0.2.2
 tornado==4.4.2
 tornado-redis==2.4.18
