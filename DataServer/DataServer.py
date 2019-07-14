@@ -1,383 +1,194 @@
-#!/usr/bin/python3
-
 """
-AUTHOR: Matthew May - mcmay.web@gmail.com
+AUTHORS:    Matthew May - mcmay.web@gmail.com
+            Tobias Frei - shuntingyard@gmail.com
 """
 
-# Imports
-import json
+import logging
+import socketserver
+import struct
+import urllib.request
 
-# import logging
+from ipaddress import ip_address
+from datetime import datetime
+
 import maxminddb
-
-# import re
-import redis
-import io
 
 from const import META, PORTMAP
 
-from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from os import getuid
-from sys import exit
 
-# from textwrap import dedent
-from time import gmtime, localtime, sleep, strftime
+# globals
+logger = logging.getLogger(__name__)
+mmreader = None  # for maxminddb
 
-# start the Redis server if it isn't started already.
-# $ redis-server
-# default port is 6379
-# make sure system can use a lot of memory and overcommit memory
+# Used to replace private IP addresses in flows. TODO Make this configurable.
+hq_ipa = urllib.request.urlopen('https://ident.me').read().decode('utf8')
+hq_lat = None
+hq_long = None  # latter two initialized from main
 
-redis_ip = "127.0.0.1"
-redis_instance = None
-
-# required input paths
-syslog_path = "/var/log/syslog"
-# syslog_path = '/var/log/reverse-proxy.log'
-db_path = "../DataServerDB/GeoLite2-City.mmdb"
-
-# file to log data
-# log_file_out = '/var/log/map_data_server.out'
-
-# ip for headquarters
-hq_ip = "8.8.8.8"
-
-# stats
-server_start_time = strftime("%d-%m-%Y %H:%M:%S", localtime())  # local time
-event_count = 0
-continents_tracked = {}
-countries_tracked = {}
-country_to_code = {}
-ip_to_code = {}
-ips_tracked = {}
-unknowns = {}
-
-# @IDEA
-# ---------------------------------------------------------
-# Use a class to nicely wrap everything:
-# Could attempt to do an access here
-# now without worrying about key errors,
-# or just keep the filled data structure
-#
-# class Instance(dict):
-#
-#    defaults = {
-#                'city': {'names':{'en':None}},
-#                'continent': {'names':{'en':None}},
-#                'continent': {'code':None},
-#                'country': {'names':{'en':None}},
-#                'country': {'iso_code':None},
-#                'location': {'latitude':None},
-#                'location': {'longitude':None},
-#                'location': {'metro_code':None},
-#                'postal': {'code':None}
-#                }
-#
-#    def __init__(self, seed):
-#        self(seed)
-#        backfill()
-#
-#    def backfill(self):
-#        for default in self.defaults:
-#            if default not in self:
-#                self[default] = defaults[default]
-# ---------------------------------------------------------
-
-# Create clean dictionary using unclean db dictionary contents
-def clean_db(unclean):
-    selected = {}
-    for tag in META:
-        head = None
-        if tag["tag"] in unclean:
-            head = unclean[tag["tag"]]
-            for node in tag["path"]:
-                if node in head:
-                    head = head[node]
-                else:
-                    head = None
-                    break
-            selected[tag["lookup"]] = head
-
-    return selected
+HEADER_LEN = 24  # these are for NetFlow V5 wire level
+DATA_LEN = 48
 
 
-def connect_redis(redis_ip):
-    r = redis.StrictRedis(host=redis_ip, port=6379, db=0)
-    return r
+# strip unwanted attributes from maxmind lookup results
+def geo_lookup(ip_str):
+    info = mmreader.get(ip_str)
+    if not info:
+        raise KeyError(ip_str)
+
+    def clean_db(unclean):
+        selected = {}
+        for tag in META:
+            head = None
+            if tag["tag"] in unclean:
+                head = unclean[tag["tag"]]
+                for node in tag["path"]:
+                    if node in head:
+                        head = head[node]
+                    else:
+                        head = None
+                        break
+                selected[tag["lookup"]] = head
+
+        return selected
+    return clean_db(info)
 
 
-def get_msg_type():
-    # @TODO
-    # Add support for more message types later
-    return "Traffic"
+def append_geoinfo(flow):
+    """TODO"""
 
+    if flow["src_ip"].is_private:
 
-# Check to see if packet is using an interesting TCP/UDP protocol based on source or destination port
-def get_tcp_udp_proto(src_port, dst_port):
-    src_port = int(src_port)
-    dst_port = int(dst_port)
+        flow["src_ip"] = hq_ipa
+        flow["src_lat"] = hq_lat
+        flow["src_long"] = hq_long
 
-    if src_port in PORTMAP:
-        return PORTMAP[src_port]
-    if dst_port in PORTMAP:
-        return PORTMAP[dst_port]
-
-    return "OTHER"
-
-
-def find_hq_lat_long(hq_ip):
-    hq_ip_db_unclean = parse_maxminddb(db_path, hq_ip)
-    if hq_ip_db_unclean:
-        hq_ip_db_clean = clean_db(hq_ip_db_unclean)
-        dst_lat = hq_ip_db_clean["latitude"]
-        dst_long = hq_ip_db_clean["longitude"]
-        hq_dict = {"dst_lat": dst_lat, "dst_long": dst_long}
-        return hq_dict
+        addr = str(flow["dst_ip"])
+        flow.update(geo_lookup(addr))
+        flow["dst_ip"] = addr
     else:
-        print("Please provide a valid IP address for headquarters")
-        exit()
+        flow["dst_ip"] = hq_ipa
+        flow["dst_lat"] = hq_lat
+        flow["dst_long"] = hq_long
+
+        addr = str(flow["src_ip"])
+        flow.update(geo_lookup(addr))
+        flow["src_ip"] = addr
+
+    # rewrite flow attributes
+    flow["src_port"] = PORTMAP.get(flow["src_port"], flow["src_port"])
+    flow["dst_port"] = PORTMAP.get(flow["dst_port"], flow["dst_port"])
+
+    print(flow)
 
 
-def parse_maxminddb(db_path, ip):
-    try:
-        reader = maxminddb.open_database(db_path)
-        response = reader.get(ip)
-        reader.close()
-        return response
-    except FileNotFoundError:
-        print("DB not found")
-        print("SHUTTING DOWN")
-        exit()
-    except ValueError:
-        return False
+def filter(unpacked):
+    """Return True if ip addresses accepted"""
+    private = False
+    for ipn in unpacked[:2]:
+        ipa = ip_address(ipn)
+        if ipa.is_link_local or ipa.is_multicast:
+            return False
+        if private and ipa.is_private:
+            return False  # intranet only
+        if ipa.is_private:
+            private = True
+    return True
 
 
-# @TODO
-# Refactor/improve parsing
-# This function depends heavily on which appliances are generating logs
-# For now it is only here for testing
+def process_nf5(export_t, count, packet):
+    """Unpack netflow data (and pass on to put JSON msg together)"""
+
+    for i in range(count):
+        ptr = HEADER_LEN + i * DATA_LEN
+
+        # quick again, we just unpack the data we want to pass on
+        unpacked = struct.unpack(
+            "!II" + 24 * "x" + "HHxxB" + 9 * "x", packet[ptr : ptr + DATA_LEN]
+        )
+
+        # drop broadcast, multicast etc.
+        if not filter(unpacked):
+            continue
+
+        flow = {}
+        flow["src_ip"] = ip_address(unpacked[0])
+        flow["dst_ip"] = ip_address(unpacked[1])
+        flow["src_port"] = unpacked[2]
+        flow["dst_port"] = unpacked[3]
+        flow["protocol"] = unpacked[4]
+
+        # Not strictly from Cisco, but good for the app server
+        flow["type"] = "LogXY"
+
+        # TODO For now the export time is taken. But this is inaccurate as
+        # flows for long TPC connections do have started earlier.
+        flow["event_time"] = datetime.fromtimestamp(export_t).strftime(
+            "%b %m %Y %H:%M:%S"
+        )
+
+        append_geoinfo(flow)
 
 
-def parse_syslog(line):
-    line = line.split()
-    data = line[-1]
-    data = data.split(",")
+class SocketServerHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        """Basics to handle wire-level NetFlow"""
+        addr = self.client_address[0]
 
-    if len(data) != 6:
-        print("NOT A VALID LOG")
-        return False
-    else:
-        src_ip = data[0]
-        dst_ip = data[1]
-        src_port = data[2]
-        dst_port = data[3]
-        type_attack = data[4]
-        cve_attack = data[5]
-        data_dict = {
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "src_port": src_port,
-            "dst_port": dst_port,
-            "type_attack": type_attack,
-            "cve_attack": cve_attack,
-        }
-        return data_dict
+        export_packet = self.request[0]
 
+        # make it quick, take version, count, time and engine_id
+        header = struct.unpack(
+            "!HHxxxxIxxxxxxxxxBxx", export_packet[:HEADER_LEN]
+        )
+        ver, count, export_t, engine_id = header
 
-def shutdown_and_report_stats():
-    print("\nSHUTTING DOWN")
-    # Report stats tracked
-    print("\nREPORTING STATS...")
-    print("\nEvent Count: {}".format(event_count))  # report event count
-    print("\nContinent Stats...")  # report continents stats
-    for key in continents_tracked:
-        print("{}: {}".format(key, continents_tracked[key]))
-    print("\nCountry Stats...")  # report country stats
-    for country in countries_tracked:
-        print("{}: {}".format(country, countries_tracked[country]))
-    print("\nCountries to iso_codes...")
-    for key in country_to_code:
-        print("{}: {}".format(key, country_to_code[key]))
-    print("\nIP Stats...")  # report IP stats
-    for ip in ips_tracked:
-        print("{}: {}".format(ip, ips_tracked[ip]))
-    print("\nIPs to iso_codes...")
-    for key in ip_to_code:
-        print("{}: {}".format(key, ip_to_code[key]))
-    print("\nUnknowns...")
-    for key in unknowns:
-        print("{}: {}".format(key, unknowns[key]))
-    exit()
-
-
-# def menu():
-# Instantiate parser
-# parser = ArgumentParser(
-#        prog='DataServer.py',
-#        usage='%(progs)s [OPTIONS]',
-#        formatter_class=RawDescriptionHelpFormatter,
-#        description=dedent('''\
-#                --------------------------------------------------------------
-#                Data server for attack map application.
-#                --------------------------------------------------------------'''))
-
-# @TODO --> Add support for command line args?
-# define command line arguments
-# parser.add_argument('-db', '--database', dest='db_path', required=True, type=str, help='path to maxmind database')
-# parser.add_argument('-m', '--readme', dest='readme', help='print readme')
-# parser.add_argument('-o', '--output', dest='output', help='file to write logs to')
-# parser.add_argument('-r', '--random', action='store_true', dest='randomize', help='generate random IPs/protocols for demo')
-# parser.add_argument('-rs', '--redis-server-ip', dest='redis_ip', type=str, help='redis server ip address')
-# parser.add_argument('-sp', '--syslog-path', dest='syslog_path', type=str, help='path to syslog file')
-# parser.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='run server in verbose mode')
-
-# Parse arguments/options
-# args = parser.parse_args()
-# return args
-
-
-def merge_dicts(*args):
-    super_dict = {}
-    for arg in args:
-        super_dict.update(arg)
-    return super_dict
-
-
-def track_flags(super_dict, tracking_dict, key1, key2):
-    if key1 in super_dict:
-        if key2 in super_dict:
-            if key1 in tracking_dict:
-                return None
-            else:
-                tracking_dict[super_dict[key1]] = super_dict[key2]
+        if ver != 5:
+            logger.error("Bad packet, I want NetFlow V5!")
         else:
-            return None
-    else:
-        return None
+            logger.debug(
+                "Got {:4d} bytes from exporter {:d} at {}".format(
+                    len(export_packet), engine_id, addr
+                )
+            )
 
+        # quick test: total packet length must be:
+        total = HEADER_LEN + count * DATA_LEN
+        assert total == len(export_packet)
 
-def track_stats(super_dict, tracking_dict, key):
-    if key in super_dict:
-        node = super_dict[key]
-        if node in tracking_dict:
-            tracking_dict[node] += 1
-        else:
-            tracking_dict[node] = 1
-    else:
-        if key in unknowns:
-            unknowns[key] += 1
-        else:
-            unknowns[key] = 1
+        process_nf5(export_t, count, export_packet)
 
 
 def main():
-    if getuid() != 0:
-        print("Please run this script as root")
-        print("SHUTTING DOWN")
-        exit()
+    """For module testing"""
 
-    global db_path, log_file_out, redis_ip, redis_instance, syslog_path, hq_ip
-    global continents_tracked, countries_tracked, ips_tracked, postal_codes_tracked, event_count, unknown, ip_to_code, country_to_code
+    # stuff to be configurable
 
-    # args = menu()
+    db_path = "../DataServerDB/GeoLite2-City.mmdb"
+    host = "0.0.0.0"
+    port = 2055
 
-    # Connect to Redis
-    redis_instance = connect_redis(redis_ip)
+    # the minimum to see what we're doing
+    logging.basicConfig(level=logging.DEBUG)
 
-    # Find HQ lat/long
-    hq_dict = find_hq_lat_long(hq_ip)
+    # load
+    logging.info("Loading maxminddb...")
+    global mmreader
+    mmreader = maxminddb.open_database(db_path)
 
-    # Follow/parse/format/publish syslog data
-    with io.open(syslog_path, "r", encoding="ISO-8859-1") as syslog_file:
-        syslog_file.readlines()
-        while True:
-            where = syslog_file.tell()
-            line = syslog_file.readline()
-            if not line:
-                sleep(0.1)
-                syslog_file.seek(where)
-            else:
-                syslog_data_dict = parse_syslog(line)
-                if syslog_data_dict:
-                    ip_db_unclean = parse_maxminddb(
-                        db_path, syslog_data_dict["src_ip"]
-                    )
-                    if ip_db_unclean:
-                        event_count += 1
-                        ip_db_clean = clean_db(ip_db_unclean)
+    # init headquarters
+    global hq_lat, hq_long
+    geo = geo_lookup(hq_ipa)
+    hq_lat = geo["latitude"]
+    hq_long = geo["longitude"]
 
-                        msg_type = {"msg_type": get_msg_type()}
-                        msg_type2 = {
-                            "msg_type2": syslog_data_dict["type_attack"]
-                        }
-                        msg_type3 = {
-                            "msg_type3": syslog_data_dict["cve_attack"]
-                        }
-
-                        proto = {
-                            "protocol": get_tcp_udp_proto(
-                                syslog_data_dict["src_port"],
-                                syslog_data_dict["dst_port"],
-                            )
-                        }
-                        super_dict = merge_dicts(
-                            hq_dict,
-                            ip_db_clean,
-                            msg_type,
-                            msg_type2,
-                            msg_type3,
-                            proto,
-                            syslog_data_dict,
-                        )
-
-                        # Track Stats
-                        track_stats(
-                            super_dict, continents_tracked, "continent"
-                        )
-                        track_stats(super_dict, countries_tracked, "country")
-                        track_stats(super_dict, ips_tracked, "src_ip")
-                        event_time = strftime(
-                            "%d-%m-%Y %H:%M:%S", localtime()
-                        )  # local time
-                        # event_time = strftime("%Y-%m-%d %H:%M:%S", gmtime()) # UTC time
-                        track_flags(
-                            super_dict, country_to_code, "country", "iso_code"
-                        )
-                        track_flags(
-                            super_dict, ip_to_code, "src_ip", "iso_code"
-                        )
-
-                        # Append stats to super_dict
-                        super_dict["event_count"] = event_count
-                        super_dict["continents_tracked"] = continents_tracked
-                        super_dict["countries_tracked"] = countries_tracked
-                        super_dict["ips_tracked"] = ips_tracked
-                        super_dict["unknowns"] = unknowns
-                        super_dict["event_time"] = event_time
-                        super_dict["country_to_code"] = country_to_code
-                        super_dict["ip_to_code"] = ip_to_code
-
-                        json_data = json.dumps(super_dict)
-                        redis_instance.publish(
-                            "attack-map-production", json_data
-                        )
-
-                        # if args.verbose:
-                        #    print(ip_db_unclean)
-                        #    print('------------------------')
-                        #    print(json_data)
-                        #    print('Event Count: {}'.format(event_count))
-                        #    print('------------------------')
-
-                        print("Event Count: {}".format(event_count))
-                        print("------------------------")
-
-                    else:
-                        continue
+    s = socketserver.UDPServer((host, port), SocketServerHandler)
+    logging.info("UDP listener on %s:%d" % (s.server_address[0], port))
+    try:
+        s.serve_forever()
+    except KeyboardInterrupt:
+        s.shutdown()
+        logging.info("listener shutdown")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        shutdown_and_report_stats()
+    main()
