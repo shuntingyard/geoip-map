@@ -6,6 +6,7 @@ AUTHOR: Matthew May - mcmay.web@gmail.com
 
 # Imports
 import json
+import redis
 import tornadoredis
 
 # import tornado.httpserver
@@ -15,7 +16,7 @@ import tornado.websocket
 
 # import re
 
-# from os import getuid, path
+from os import getuid, path
 from sys import exit
 
 
@@ -36,7 +37,6 @@ service_rgb = {
     "RDP": "#ff0060",
     "DoS": "#ff0000",
     "ICMP": "#ffcccc",
-    "OTHER": "#6600cc",
 }
 
 
@@ -64,9 +64,7 @@ class WebSocketChatHandler(tornado.websocket.WebSocketHandler):
             self.client = tornadoredis.Client("127.0.0.1")
             self.client.connect()
             print("[*] Connected to Redis server")
-            yield tornado.gen.Task(
-                self.client.subscribe, "attack-map-production"
-            )
+            yield tornado.gen.Task(self.client.subscribe, "test_channel")
             self.client.listen(self.on_message)
         except Exception as ex:
             print("[*] Could not connect to Redis server.")
@@ -87,6 +85,9 @@ class WebSocketChatHandler(tornado.websocket.WebSocketHandler):
             # fp = open('/mnt/map_attack_blk/LOG4.log','a')
             # fp.write(ip[1]+"\n")
             # fp.close()
+
+        # a lifesign
+        # print("len msg", len(msg), "msg", msg)
 
         try:
             json_data = json.loads(msg.body)
@@ -166,7 +167,7 @@ class WebSocketChatHandler(tornado.websocket.WebSocketHandler):
         else:
             postal_code = None
         if protocol:
-            color = service_rgb[protocol]
+            color = service_rgb.get(protocol, "#6600cc")
         else:
             color = "#000000"
         if "event_count" in json_data:
@@ -233,6 +234,7 @@ class WebSocketChatHandler(tornado.websocket.WebSocketHandler):
             "ip_to_code": ip_to_code,
         }
 
+        print("Message:", msg_to_send)
         self.write_message(json.dumps(msg_to_send))
 
 

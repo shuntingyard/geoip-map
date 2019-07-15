@@ -2,7 +2,7 @@
 
 1. Modify `DataServer` to read NetFlow V5 input over UDP
 2. Keep geoip database part and integrate with flow records read
-3. Omit Redis and make `DataServer` a module directly imported ba the main app.
+3. ~~Omit Redis and make `DataServer` a module directly imported by the main app.~~ (Except for the simplicity of starting only one process/server there is little use in doing so, as it woult burden the implementation with asyncio/dequeue.)
 
 ### First and Foremost
 I do not have much time in my life right now to maintain this project. I undertook this challenge as a means to learn JavaScript, and to improve upon the Python I already knew. I'm sure there are several things I could have done differently in my implementation, and I won't be offended if I receive constructive criticism from someone who downloads and views my code. I know I learned a ton when working on this, and I hope the open source community will continue to teach me things :)

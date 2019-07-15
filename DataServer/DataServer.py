@@ -3,6 +3,7 @@ AUTHORS:    Matthew May - mcmay.web@gmail.com
             Tobias Frei - shuntingyard@gmail.com
 """
 
+import json
 import logging
 import socketserver
 import struct
@@ -12,6 +13,7 @@ from ipaddress import ip_address
 from datetime import datetime
 
 import maxminddb
+import redis
 
 from const import META, PORTMAP
 
@@ -19,6 +21,7 @@ from const import META, PORTMAP
 # globals
 logger = logging.getLogger(__name__)
 mmreader = None  # for maxminddb
+redis_instance = None
 
 # Used to replace private IP addresses in flows. TODO Make this configurable.
 hq_ipa = urllib.request.urlopen('https://ident.me').read().decode('utf8')
@@ -77,8 +80,17 @@ def append_geoinfo(flow):
     # rewrite flow attributes
     flow["src_port"] = PORTMAP.get(flow["src_port"], flow["src_port"])
     flow["dst_port"] = PORTMAP.get(flow["dst_port"], flow["dst_port"])
+    
+    # patch something halfway expected into the (customarily considered as
+    # layer4) protocol field:
+    if flow["protocol"] == 1:
+        flow["protocol"] == "ICMP"
+    elif isinstance(flow["src_port"], str):
+        flow["protocol"] = flow["src_port"]
+    elif isinstance(flow["dst_port"], str):
+        flow["protocol"] = flow["dst_port"]
 
-    print(flow)
+    redis_instance.publish("test_channel", json.dumps(flow))
 
 
 def filter(unpacked):
@@ -118,7 +130,7 @@ def process_nf5(export_t, count, packet):
         flow["protocol"] = unpacked[4]
 
         # Not strictly from Cisco, but good for the app server
-        flow["type"] = "LogXY"
+        flow["msg_type"] = "Traffic"
 
         # TODO For now the export time is taken. But this is inaccurate as
         # flows for long TPC connections do have started earlier.
@@ -166,6 +178,8 @@ def main():
     db_path = "../DataServerDB/GeoLite2-City.mmdb"
     host = "0.0.0.0"
     port = 2055
+    redis_host = "0.0.0.0"
+    redis_port = 6379
 
     # the minimum to see what we're doing
     logging.basicConfig(level=logging.DEBUG)
@@ -180,6 +194,10 @@ def main():
     geo = geo_lookup(hq_ipa)
     hq_lat = geo["latitude"]
     hq_long = geo["longitude"]
+
+    # redis
+    global redis_instance
+    redis_instance = redis.StrictRedis(host=redis_host, port=redis_port, db=0)
 
     s = socketserver.UDPServer((host, port), SocketServerHandler)
     logging.info("UDP listener on %s:%d" % (s.server_address[0], port))
